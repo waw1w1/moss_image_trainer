@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moss-trainer"
+version = "0.1.0"
+description = "MOSS-Image adapter training with kohya-style resolution buckets"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "torch==2.14.1+cu132",
+  "diffusers==0.41.0",
+  "transformers==5.18.0",
+  "accelerate>=1.10,<2",
+  "lycoris-lora==4.0.0",
+  "safetensors==0.8.0",
+  "Pillow==12.3.0",
+  "numpy>=2,<3",
+  "einops>=0.8,<1",
+  "tqdm>=4.67,<5",
+  "tensorboard>=2.20,<3",
+  "triton==3.8.0",
+]
+
+[project.scripts]
+moss-trainer = "moss_trainer.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moss_trainer"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true

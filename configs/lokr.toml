@@ -1,0 +1,144 @@
+# 数据集与输出路径：相对路径以运行命令的工作目录为基准，建议从项目根目录运行。
+[paths]
+# 训练图片及同名描述文件所在目录，支持子目录。
+image_dir = "datasets/train"
+# LoKr 权重及完整续训检查点的输出目录。
+output_dir = "outputs/lokr"
+# 模型加载格式：hf 使用完整目录；comfyui 使用下方分别指定的 model、te、vae 文件。
+model_format = "hf"
+# HF 模型根目录；comfyui 模式只从此读取官方配置、tokenizer 和 pipeline 脚本，无需其中的 HF 权重。
+model_dir = "models/MOSS-Image-Base"
+# ComfyUI DiT 文件路径，例如 models/diffusion_models/moss_image_base_bf16.safetensors；hf 模式留空。
+model = ""
+# ComfyUI Qwen3.5-9B 文本编码器文件路径；必须为未量化的 .safetensors，hf 模式留空。
+te = ""
+# ComfyUI MOSS VAE 文件路径；保留原缓存精度时使用 FP32 文件，hf 模式留空。
+vae = ""
+# 冻结文本编码器与 VAE 的特征缓存根目录。
+cache_dir = "cache/train"
+
+# 数据集设置：控制描述文件、图片分桶、批大小和重复次数。
+[dataset]
+# 图片对应描述文件的扩展名；文件须与图片同名，并使用 UTF-8 编码。
+caption_extension = ".txt"
+# 目标分辨率 [宽, 高]；启用分桶时以两者乘积限制目标像素面积。
+resolution = [1024, 1024]
+# 按图片长宽比分桶，减少裁切；同一批次使用相同尺寸。
+enable_bucket = true
+# 固定候选桶的最小边长；bucket_no_upscale=true 时不参与选桶。
+min_bucket_reso = 256
+# 固定候选桶的最大边长；bucket_no_upscale=true 时不参与选桶。
+max_bucket_reso = 2048
+# 桶尺寸的像素步长，必须是 16 的倍数。
+bucket_reso_steps = 64
+# 不放大小图；采用 kohya 语义，此时选桶忽略上述最小、最大边长限制。
+bucket_no_upscale = true
+# 每次前向、反向处理的图片数；增大会提高显存需求。
+batch_size = 1
+# 每轮数据集中每张图片的重复次数。
+num_repeats = 1
+
+# 数据集缓存设置：控制文本特征的长度上限。
+[cache]
+# 提示词最多允许的 token 数；超限会报错，不静默截断。
+max_sequence_length = 4096
+
+# 适配器设置：控制训练哪些模块以及 LoKr 的结构。
+[network]
+# 适配器算法；lokr 使用 Kronecker 积形式学习权重增量。
+algo = "lokr"
+# 低秩模式的因子分解秩；full_matrix=true 时不再分解因子，保留 16 即可。
+dim = 16
+# 低秩模式的缩放系数；全维度模式由 LyCORIS 使用单位缩放，无需把 alpha 调到超大。
+alpha = 16.0
+# LoKr 的 Kronecker 维度分解因子；当前编译路径要求为 8。
+factor = 8
+# 直接启用完整 Kronecker 因子矩阵，等效于足够大的 dim/alpha 触发的全维度模式，可与编译同时开启。
+full_matrix = true
+# 是否尝试同时低秩分解两个 Kronecker 因子；当前编译路径要求关闭。
+decompose_both = false
+# attention-mlp 训练注意力和前馈线性层；attention 只选注意力线性层。
+target = "attention-mlp"
+# 是否额外适配 DiT 文本投影及两层文本细化；false 冻结它们，允许预缓存细化结果。
+train_text_projection = false
+# 训练主干和输出层的 RMSNorm 权重增量；文本细化的 Norm 随 train_text_projection 开关，可与融合/编译/卸载组合。
+train_norm = true
+# 普通 dropout 概率；当前 LoKr 不支持非零值，保持为 0。
+dropout = 0.0
+# LoKr 重建权重时随机屏蔽输出通道的概率；0 为关闭，当前编译路径要求为 0。
+rank_dropout = 0.0
+# 随机跳过整个适配器分支的概率；0 为关闭，当前编译路径要求为 0。
+module_dropout = 0.0
+# DyLoRA 的秩分块大小；当前 lokr 算法不使用此参数。
+block_size = 4
+# 是否使用权重分解式适配；当前编译路径要求关闭。
+dora_wd = false
+
+# 训练设置：控制优化器、梯度累积、检查点、噪声采样和保存频率。
+[training]
+# 示例总轮数，训练前自行填写；1 epoch 遍历含重复次数的全部分桶批次。
+max_epochs = 20
+# AdamW 的目标学习率；预热结束后保持此值。
+learning_rate = 0.0001
+# AdamW 权重衰减系数，用于正则化可训练参数。
+weight_decay = 0.01
+# 累积多少个微批次后更新一次参数；当前满批有效批大小为 1 × 4 = 4。
+gradient_accumulation_steps = 4
+# packed 对多样本做变长打包并行；batch_size=1 时保留单样本路径。
+batch_mode = "packed"
+# 梯度裁剪的最大总范数，用于限制过大的更新。
+max_grad_norm = 1.0
+# 启用梯度检查点，通过反向时重算前向来降低激活显存。
+gradient_checkpointing = true
+# full 重算完整块；attention 保留注意力结果以减少重算；当前编译路径要求 full。
+checkpoint_policy = "full"
+# -1 为全部 42 个主干块启用检查点；当前编译路径要求全部启用。
+checkpoint_blocks = -1
+# 学习率预热的优化器更新步数（不是 epoch）；之后保持目标学习率，0 表示不预热。
+warmup_steps = 100
+# 示例保存间隔，训练前自行填写；每隔这么多个完整 epoch 保存，最后一个 epoch 始终保存。
+save_every_epochs = 1
+# 随机种子，用于适配器初始化、数据顺序、噪声和随机丢弃。
+seed = 42
+# 训练时间步分布；logit_normal 使用 sigmoid 映射的正态采样，也可选 uniform。
+timestep_sampling = "logit_normal"
+# logit_normal 采样时的正态分布均值；uniform 时不使用。
+logit_mean = 0.0
+# logit_normal 采样时的正态分布标准差；uniform 时不使用。
+logit_std = 1.0
+# 训练时间分布偏移系数；1 表示不偏移，与推理时的 shift=5 不同。
+timestep_shift = 1.0
+# 将每条描述替换为真实空提示词特征的概率；0.1 表示 10%。
+caption_dropout = 0.1
+# 读取缓存特征的数据加载子进程数；0 表示在主进程读取。
+num_workers = 0
+# 后台进程记录 TensorBoard 指标和预览；异常或日志队列满不会中断或阻塞训练。
+tensorboard = true
+
+# 特殊优化：融合计算、编译和 CPU 检查点卸载；续训时沿用断点的执行设置。
+[optimization]
+# 融合 SITU 激活的前向、反向运算，减少内核开销并保留 BF16 中间舍入。
+fused_situ = true
+# 融合 RMSNorm 的逐元素运算，保留原 FP32 归约和两条梯度路径。
+fused_rmsnorm = true
+# 编译主干块与检查点以提速；依赖上述双融合和全部 full 检查点，首次运行需编译。
+compile_blocks = true
+# 将检查点输入激活暂存 CPU 固定内存，反向时传回 GPU；节省显存，有少量传输开销。
+checkpoint_offload = true
+
+# 训练预览：固定 50 步，使用 training.seed 作为固定噪声种子，便于比较各 epoch。
+[sample]
+# 预览图的正面提示词；修改后重跑 cache 即可补齐文字特征，已有图片缓存会复用。
+positive = "A serene mountain landscape, soft natural light."
+# 预览图的负面提示词，空字符串表示真实空提示词。
+negative = ""
+# CFG 引导强度；1 表示关闭 CFG，只使用正面提示词。
+cfg = 3.0
+# 预览分辨率 [宽, 高]，两边均须为 16 的倍数，不改变训练分辨率。
+resolution = [1024, 1024]
+# 噪声调度器：moss 使用官方 shift=5 的训练网格对齐调度；linear 使用均匀时间调度。
+scheduler = "moss"
+# 采样器：euler 为单次评估欧拉法；heun 增加校正评估，预览更慢。
+sampler = "euler"
+# 每隔多少个完整 epoch 出一张预览图；0 关闭预览，可在训练前自行修改。
+every_epochs = 1
