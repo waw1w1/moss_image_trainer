@@ -70,9 +70,17 @@ dora_wd = false
 [training]
 # 示例总轮数，训练前自行填写；1 epoch 遍历含重复次数的全部分桶批次。
 max_epochs = 20
-# AdamW 的目标学习率；预热结束后保持此值。
+# 优化器可选：adamw（默认）、adam、sgd（momentum=0.9）、rmsprop；其余参数使用 PyTorch 默认值。
+optimizer = "adamw"
+# 学习率调度可选：constant（预热后恒定）、linear（线性下降）、cosine（余弦下降）、
+# cosine_with_restarts（余弦下降并重启）；默认 cosine 不重启。
+scheduler = "cosine"
+# 仅 cosine_with_restarts 生效；表示额外重启次数，2 = 3 个等长余弦周期；0 = 不重启。
+# 重启仅重置学习率，不清空优化器状态，也不重复预热；其他 scheduler 忽略此项。
+cosine_restarts = 0
+# 预热结束时的目标学习率；随后按 scheduler 变化，下降型调度在训练结束时降至 0。
 learning_rate = 0.0001
-# AdamW 权重衰减系数，用于正则化可训练参数。
+# 优化器权重衰减系数；AdamW 使用解耦衰减，其余优化器使用各自原生实现。
 weight_decay = 0.01
 # 累积多少个微批次后更新一次参数；当前满批有效批大小为 1 × 4 = 4。
 gradient_accumulation_steps = 4
@@ -86,8 +94,9 @@ gradient_checkpointing = true
 checkpoint_policy = "full"
 # -1 为全部 42 个主干块启用检查点；当前编译路径要求全部启用。
 checkpoint_blocks = -1
-# 学习率预热的优化器更新步数（不是 epoch）；之后保持目标学习率，0 表示不预热。
-warmup_steps = 100
+# 预热占一个 epoch 的比例，范围 0~1；0.3 = 第一个 epoch 的前 30%，0 = 不预热。
+# 按每轮优化器更新次数（已考虑梯度累积）向上取整；只在训练开始时预热一次。
+warmup_ratio = 0.3
 # 示例保存间隔，训练前自行填写；每隔这么多个完整 epoch 保存，最后一个 epoch 始终保存。
 save_every_epochs = 1
 # 随机种子，用于适配器初始化、数据顺序、噪声和随机丢弃。

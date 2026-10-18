@@ -17,7 +17,7 @@ from .checkpoints import load_checkpoint, restore_checkpoint, save_checkpoint, v
 from .config import Config
 from .data import CachedDataset, collate_cached, digest, verify_cache
 from .modeling import enable_checkpointing, load_transformer, require_cuda, transformer_structure
-from .scheduling import training_plan
+from .scheduling import build_optimizer, build_scheduler, training_plan
 from .telemetry import TensorBoardLogger
 
 
@@ -58,18 +58,26 @@ def apply_caption_dropout(context, mask, empty, probability):
     return padded, output_mask
 
 
-def train(config: Config, resume=None):
+def train(config: Config, resume=None, *, new_stage=False):
     """Explicit training entry point. Never called by doctor, inspect or bucket planning."""
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("This initial trainer supports one GPU; launch with uv run, not distributed launch")
+    if new_stage and not resume:
+        raise ValueError("--new-stage requires --resume")
+    if new_stage:
+        output = Path(config.training.output_dir)
+        if output.resolve() == Path(resume).resolve().parent:
+            raise ValueError("A new stage requires a separate empty output directory")
+        if output.exists() and any(output.iterdir()):
+            raise ValueError("A new stage requires an empty output directory")
     require_cuda()
     spec, cache_directory = verify_cache(config)
     records = spec["records"]
     sampler = BucketBatchSampler(records, config.dataset.batch_size, config.dataset.num_repeats, config.training.seed)
     batch_count = sampler.total_batches
     plan = training_plan(config.training, batch_count)
-    state = load_checkpoint(resume, config, spec, batch_count=batch_count) if resume else None
-    step, epoch, start_batch = (state["step"], state["epoch"], state["next_batch"]) if state else (0, 0, 0)
+    state = load_checkpoint(resume, config, spec, batch_count=batch_count, new_stage=new_stage) if resume else None
+    step, epoch, start_batch = (state["step"], state["epoch"], state["next_batch"]) if state and not new_stage else (0, 0, 0)
     output = Path(config.training.output_dir)
     validate_output_directory(output, resume, step, plan.max_steps, epoch=epoch, max_epochs=plan.max_epochs)
     # Check an unavoidable lower bound before loading a full-sized model.
@@ -108,14 +116,8 @@ def train(config: Config, resume=None):
                              offload=config.training.checkpoint_offload,
                              blocks=config.training.checkpoint_blocks)
     parameters = [p for p in network.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        parameters, lr=config.training.learning_rate, weight_decay=config.training.weight_decay,
-        foreach=False,
-    )
-    warmup = config.training.warmup_steps
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda step: min(1.0, (step + 1) / max(1, warmup)),
-    )
+    optimizer = build_optimizer(parameters, config.training)
+    scheduler = build_scheduler(optimizer, config.training, plan)
     dataset = CachedDataset(records, cache_directory, text_directory=text_directory)
     # A private DataLoader RNG leaves model/dropout RNG unchanged when resuming.
     loader_generator = torch.Generator()
@@ -126,7 +128,12 @@ def train(config: Config, resume=None):
     )
     empty = load_file(str(text_directory / f"text-{digest('')}.safetensors"))["embedding"]
     if state is not None:
-        restore_checkpoint(resume, state, network, optimizer, scheduler)
+        restore_checkpoint(resume, state, network, optimizer, scheduler, new_stage=new_stage)
+        if new_stage:
+            print(json.dumps({"new_stage": True, "source_step": state["step"],
+                              "source_epoch": state["epoch"], "stage_max_epochs": plan.max_epochs,
+                              "stage_max_steps": plan.max_steps, "initial_lr": optimizer.param_groups[0]["lr"],
+                              "warmup_steps": plan.warmup_steps}), flush=True)
         del state
     output.mkdir(parents=True, exist_ok=True)
     accumulation = config.training.gradient_accumulation_steps
@@ -173,6 +180,8 @@ def train(config: Config, resume=None):
                     "grad_norm": float(grad_norm), "lr": update_learning_rate,
                     "bucket": [latent.shape[-1] * 16, latent.shape[-2] * 16],
                     "elapsed_seconds": round(time.monotonic() - started, 1),
+                    "peak_allocated_gib": round(torch.cuda.max_memory_allocated() / 2**30, 3),
+                    "peak_reserved_gib": round(torch.cuda.max_memory_reserved() / 2**30, 3),
                 }
                 print(json.dumps(statistics), flush=True)
                 update_seconds = time.monotonic() - update_started

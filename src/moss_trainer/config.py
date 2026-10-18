@@ -73,7 +73,11 @@ class Training:
     compile_blocks: bool = False
     checkpoint_offload: bool = False
     checkpoint_blocks: int = -1
-    warmup_steps: int = 100
+    optimizer: str = "adamw"
+    scheduler: str = "cosine"
+    cosine_restarts: int = 0
+    warmup_ratio: float = 0.3
+    warmup_steps: int = -1  # Legacy explicit step-based warmup; -1 selects ratio.
     save_every: int = 100
     save_every_epochs: int = 0
     seed: int = 42
@@ -156,6 +160,10 @@ def load_config(path: str | Path) -> Config:
     _expand_option_groups(raw)
     training = raw.get("training", {})
     if isinstance(training, dict):
+        if "warmup_steps" in training:
+            if "warmup_ratio" in training:
+                raise ValueError("Set either warmup_ratio or legacy warmup_steps, not both")
+            training.setdefault("scheduler", "constant")
         # Keep legacy step-based files readable, but never silently mix units.
         for epoch_key, step_key in (("max_epochs", "max_steps"), ("save_every_epochs", "save_every")):
             if epoch_key in training:
@@ -290,7 +298,13 @@ def validate(c: Config) -> None:
         n.algo == "dylora" or n.dropout or n.rank_dropout or n.module_dropout
     ):
         raise ValueError("Packed BS>1 requires deterministic adapters: disable adapter dropout and DyLoRA, or use batch_mode='sequential'")
-    if t.warmup_steps < 0 or t.num_workers < 0 or t.weight_decay < 0 or t.max_grad_norm <= 0:
+    if t.optimizer not in ("adamw", "adam", "sgd", "rmsprop"):
+        raise ValueError("optimizer must be adamw, adam, sgd or rmsprop")
+    if t.scheduler not in ("constant", "linear", "cosine", "cosine_with_restarts"):
+        raise ValueError("scheduler must be constant, linear, cosine or cosine_with_restarts")
+    if not 0 <= t.warmup_ratio <= 1 or t.cosine_restarts < 0:
+        raise ValueError("warmup_ratio must be in [0, 1] and cosine_restarts must be nonnegative")
+    if t.warmup_steps < -1 or t.num_workers < 0 or t.weight_decay < 0 or t.max_grad_norm <= 0:
         raise ValueError("Invalid training, optimizer or worker setting")
     if t.timestep_sampling not in ("uniform", "logit_normal"):
         raise ValueError("timestep_sampling must be uniform or logit_normal")

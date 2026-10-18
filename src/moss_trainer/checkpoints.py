@@ -1,6 +1,7 @@
 """Atomic checkpoint publication and validation before loading model weights."""
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -22,7 +23,19 @@ PAYLOAD_FILES = ("adapter.safetensors", "trainer-state.pt", "config.json")
 
 def _resume_signature(config, cache_fingerprint):
     values = config.as_dict()
-    # Warmup + constant LR allows extending either duration unit on resume.
+    # Decaying schedules depend on the original horizon; reject duration changes.
+    schedule_horizon = (
+        {"max_steps": config.training.max_steps, "max_epochs": config.training.max_epochs}
+        if config.training.scheduler != "constant" else None
+    )
+    if config.training.scheduler != "cosine_with_restarts":
+        values["training"].pop("cosine_restarts")
+    # Preserve the exact signature of legacy AdamW + step-warmup checkpoints.
+    if config.training.warmup_steps >= 0:
+        values["training"].pop("warmup_ratio")
+        if config.training.optimizer == "adamw" and config.training.scheduler == "constant":
+            values["training"].pop("optimizer")
+            values["training"].pop("scheduler")
     values.pop("sample")
     for field in ("output_dir", "save_every", "num_workers", "max_steps", "max_epochs", "save_every_epochs", "tensorboard"):
         values["training"].pop(field)
@@ -45,6 +58,8 @@ def _resume_signature(config, cache_fingerprint):
             values["training"].pop(field)
     if values["training"]["checkpoint_blocks"] == -1:
         values["training"].pop("checkpoint_blocks")
+    if schedule_horizon is not None:
+        values["training"].update(schedule_horizon)
     return digest({"config": values, "cache": cache_fingerprint})
 
 
@@ -114,7 +129,7 @@ def save_checkpoint(directory, network, optimizer, scheduler, config, spec, step
     return destination
 
 
-def _validate_cursor(state, config, batch_count):
+def _validate_cursor(state, config, batch_count, *, allow_complete=False):
     for key in ("step", "epoch", "next_batch"):
         if type(state[key]) is not int or state[key] < 0:
             raise ValueError(f"Checkpoint {key} must be a nonnegative integer")
@@ -125,7 +140,8 @@ def _validate_cursor(state, config, batch_count):
     updates_per_epoch = (batch_count + accumulation - 1) // accumulation
     if step != epoch * updates_per_epoch + start // accumulation:
         raise ValueError("Checkpoint step and bucket cursor are inconsistent")
-    if step >= training_plan(config.training, batch_count).max_steps:
+    limit = training_plan(config.training, batch_count).max_steps
+    if step > limit or (step == limit and not allow_complete):
         unit = "max_epochs" if config.training.max_epochs else "max_steps"
         raise ValueError(f"Increase {unit} beyond the saved checkpoint to continue")
     if state["scheduler"].get("last_epoch") != step:
@@ -139,7 +155,7 @@ def _validate_cursor(state, config, batch_count):
     random.Random().setstate(state["python_rng"])
 
 
-def load_checkpoint(directory, config, spec, *, batch_count):
+def load_checkpoint(directory, config, spec, *, batch_count, new_stage=False):
     directory = Path(directory)
     try:
         manifest = json.loads((directory / "checkpoint.json").read_text(encoding="utf-8"))
@@ -153,9 +169,21 @@ def load_checkpoint(directory, config, spec, *, batch_count):
             raise ValueError("Checkpoint manifest and training state disagree")
         if state["cache_fingerprint"] != spec["fingerprint"]:
             raise ValueError("Checkpoint feature cache differs from current model/data")
-        if state["signature"] != _resume_signature(config, spec["fingerprint"]):
+        validation_config = config
+        if new_stage:
+            # Only the learning-rate plan may change; optimizer and data remain strict.
+            saved = json.loads((directory / "config.json").read_text(encoding="utf-8"))["training"]
+            schedule_fields = ("learning_rate", "scheduler", "cosine_restarts",
+                               "warmup_steps", "warmup_ratio", "max_steps", "max_epochs")
+            validation_config = dataclasses.replace(
+                config, training=dataclasses.replace(
+                    config.training, **{key: saved[key] for key in schedule_fields}))
+        if state["signature"] != _resume_signature(validation_config, spec["fingerprint"]):
             raise ValueError("Resume model, data or training settings differ from the checkpoint")
-        _validate_cursor(state, config, batch_count)
+        _validate_cursor(state, validation_config, batch_count, allow_complete=new_stage)
+        if new_stage and (state["next_batch"] != 0 or
+                          state["step"] != training_plan(validation_config.training, batch_count).max_steps):
+            raise ValueError("A new stage requires a completed run at an epoch boundary")
         from safetensors import safe_open
         with safe_open(str(directory / "adapter.safetensors"), framework="pt", device="cpu") as stream:
             metadata = stream.metadata() or {}
@@ -201,12 +229,19 @@ def validate_output_directory(output, resume, step, max_steps, *, epoch=0, max_e
         )
 
 
-def restore_checkpoint(directory, state, network, optimizer, scheduler):
+def restore_checkpoint(directory, state, network, optimizer, scheduler, *, new_stage=False):
     if parameter_manifest(network, optimizer) != state["parameter_manifest"]:
         raise ValueError("Optimizer parameter names, shapes or ordering changed")
     load_adapter_weights(network, Path(directory) / "adapter.safetensors")
+    fresh_lrs = scheduler.get_last_lr()
+    fresh_base_lrs = list(scheduler.base_lrs)
     optimizer.load_state_dict(state["optimizer"])
-    scheduler.load_state_dict(state["scheduler"])
+    if new_stage:
+        # Preserve Adam moments and per-parameter steps, but use the fresh schedule.
+        for group, lr, base_lr in zip(optimizer.param_groups, fresh_lrs, fresh_base_lrs):
+            group["lr"], group["initial_lr"] = lr, base_lr
+    else:
+        scheduler.load_state_dict(state["scheduler"])
     torch.set_rng_state(state["torch_rng"])
     if torch.cuda.is_available():
         if state["cuda_rng"] is None:

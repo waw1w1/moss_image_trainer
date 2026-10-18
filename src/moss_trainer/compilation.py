@@ -183,13 +183,24 @@ def _block_forward(self, value, rope, modulation):
     return residual(value, self.proj['ffn_down'](activation), 5)
 
 
-def _training_only_compilation(forward, compiled, block):
+def _training_only_compilation(forward, compiled, block, cache_state=None):
+    # All main blocks share the same checkpoint code object's Dynamo cache.
+    cache_state = cache_state if cache_state is not None else {"exhausted": False}
+
     @functools.wraps(forward)
     def wrapped(*args, **kwargs):
-        # Inference does not need checkpoint compilation. Bypass Dynamo here so
-        # eval/no_grad switches do not consume training graph cache entries.
         if block.training and torch.is_grad_enabled():
-            return compiled(*args, **kwargs)
+            if not cache_state["exhausted"]:
+                try:
+                    return compiled(*args, **kwargs)
+                except torch._dynamo.exc.FailOnRecompileLimitHit:
+                    cache_state["exhausted"] = True
+                    print("Compile cache full: reuse cached graphs; new shapes use eager checkpoint execution.",
+                          file=sys.stderr, flush=True)
+            # Retain guards and existing graphs; only new variants fall back.
+            # This remains outside the compiled region and the offload hooks.
+            with torch.compiler.set_stance("eager_on_recompile"):
+                return compiled(*args, **kwargs)
         return forward(*args, **kwargs)
 
     return wrapped
@@ -270,6 +281,7 @@ def enable_compiled_checkpointing(model, *, offload=False):
         layer._moss_original_attention = module._attention
         layer.forward = types.MethodType(_block_forward, layer)
     enable_checkpointing(model)
+    cache_state = {"exhausted": False}
     for layer in model.layers:
         forward = layer.forward
         compiled = torch.compile(
@@ -279,7 +291,7 @@ def enable_compiled_checkpointing(model, *, offload=False):
             options={"emulate_precision_casts": True, "shape_padding": False,
                      "comprehensive_padding": False, "max_autotune_gemm_backends": "ATEN"},
         )
-        layer.forward = _training_only_compilation(forward, compiled, layer)
+        layer.forward = _training_only_compilation(forward, compiled, layer, cache_state)
     if offload:
         # Keep hooks outside compile(checkpoint(...)). The uncompiled text blocks
         # also use input-only offload when text adapters are being trained.

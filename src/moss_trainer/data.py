@@ -19,7 +19,7 @@ from .config import Config
 from .modeling import load_text_encoder, load_vae, pack_latents, pipeline_module, require_cuda
 from .weights import model_settings
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 
 
@@ -94,7 +94,7 @@ def cache_spec(config, records):
         "version": CACHE_VERSION, "model_fingerprint": model_id,
         "dataset": dataclasses.asdict(config.dataset),
         "cache": dataclasses.asdict(config.cache),
-        "vae_sample_seed": config.training.seed,
+        "vae_encoding": "posterior_mean",
         "records": records,
     }
     # Runtime batching and file locations do not change feature values.
@@ -194,10 +194,8 @@ def cache_dataset(config: Config):
                 image = image.crop(tuple(record["crop"]))
                 pixels = torch.from_numpy(np.asarray(image, dtype=np.float32).copy()).permute(2, 0, 1)
             pixels = (pixels.unsqueeze(0).to("cuda") / 127.5 - 1.0)
-            generator = torch.Generator(device="cuda").manual_seed(
-                (config.training.seed + int(record["key"][:16], 16)) % (2**63 - 1)
-            )
-            raw = vae.encode(pixels).latent_dist.sample(generator=generator)
+            # Flux2/MOSS uses posterior means; sampled posterior noise is not image content.
+            raw = vae.encode(pixels).latent_dist.mode()
             latent = pack_latents(raw, vae)[0]
             expected = (128, record["bucket"][1] // 16, record["bucket"][0] // 16)
             if tuple(latent.shape) != expected or not torch.isfinite(latent).all():

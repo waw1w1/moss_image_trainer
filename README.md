@@ -85,7 +85,9 @@ vae = "models/vae/moss_image_vae_fp32.safetensors"
 
 训练使用 BF16 DiT、FP32 适配器和优化器状态，损失为 rectified-flow 速度 MSE。Qwen 与 VAE 只参与缓存，训练过程中的预览解码会临时加载 VAE。
 
-`max_epochs` 控制训练轮数，`save_every_epochs` 控制保存间隔，最后一轮始终保存。1 epoch 遍历含重复次数的全部分桶批次；`warmup_steps` 按优化器更新次数计数。满批有效批大小为 `batch_size × gradient_accumulation_steps`，桶尾与轮尾按实际图片数归一化。
+`max_epochs` 控制训练轮数，`save_every_epochs` 控制保存间隔，最后一轮始终保存。1 epoch 遍历含重复次数的全部分桶批次；`warmup_ratio` 按一个 epoch 的比例指定预热：0.3 表示首轮前 30%，乘以每轮优化器更新次数后向上取整，只预热一次。满批有效批大小为 `batch_size × gradient_accumulation_steps`，桶尾与轮尾按实际图片数归一化。
+
+优化器通过 `training.optimizer` 选择 `adamw`（默认）、`adam`、`sgd`（momentum=0.9）或 `rmsprop`。学习率调度通过 `training.scheduler` 选择 `constant`、`linear`、`cosine`（默认）或 `cosine_with_restarts`；全部先执行一次预热。`cosine_restarts` 是预热后的额外重启次数，仅最后一种调度生效，0 表示不重启。保留旧 `warmup_steps` 配置兼容，未指定调度器的旧文件继续采用预热后恒定学习率；新旧预热字段不能同时填写。
 
 LoKr 示例默认 `full_matrix=true`、`train_norm=true`、`factor=8`，训练完整 Kronecker 因子和 RMSNorm 增量。LoRA 示例默认 `train_text_projection=true`，同时适配 DiT 内部文本投影和两层文本细化；Qwen 保持冻结。
 
@@ -126,8 +128,12 @@ LoKr 示例默认 `full_matrix=true`、`train_norm=true`、`factor=8`，训练�
   --resume outputs/lokr/epoch-000010
 ```
 
-续训可增加总 epoch，调整保存、预览和日志设置；模型、数据、适配器结构与执行选项需保持一致。使用最新完整检查点，或指定新的空输出目录。
+恒定学习率续训可增加总 epoch；下降型调度依赖总训练长度，续训须保持原总 epoch/步数。可调整保存、预览和日志设置；模型、数据、适配器结构与执行选项需保持一致。使用最新完整检查点，或指定新的空输出目录。
 
 LoRA/LoCon/LoKr 的 `adapter.safetensors` 使用 ComfyUI 的 `lora_unet_...` 键名，LoKr Norm 增量使用 `.w_norm`。将文件放入 ComfyUI 的 `models/loras/`，用标准 LoRA 加载节点接到匹配的 MOSS MODEL。其他 LyCORIS 算法使用原生导出格式。
 
 参考：[MOSS-Image](https://github.com/OpenMOSS/MOSS-Image)、[LyCORIS](https://github.com/KohakuBlueleaf/LyCORIS)、[kohya 分桶](https://github.com/kohya-ss/sd-scripts)、[uv](https://docs.astral.sh/uv/)。
+
+VAE image caches use the Flux2 posterior mean, not posterior sampling. Cache format v2 records vae_encoding=posterior_mean; v1 image caches and checkpoints must not be reused for corrected training. Rebuild image caches and start a new run from the base model.
+
+To continue a completed run with its adapter, optimizer moments/step counters and RNG but a fresh learning-rate schedule, use train --resume <completed-checkpoint> --new-stage --config <new-config>. Use a separate empty output directory. New-stage epoch/step counters start at zero; max_epochs is the additional duration. Only LR/scheduler/warmup/duration may differ; model/data/optimizer settings remain strict. Resume a checkpoint produced in the new stage normally, without --new-stage.

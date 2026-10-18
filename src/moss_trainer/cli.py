@@ -56,6 +56,11 @@ def bucket_summary(config):
         "images": len(records), "repeats": config.dataset.num_repeats,
         "batches_per_epoch": batches, "optimizer_updates_per_epoch": plan.updates_per_epoch,
         "max_epochs": plan.max_epochs, "total_optimizer_updates": plan.max_steps,
+        "optimizer": config.training.optimizer, "scheduler": config.training.scheduler,
+        "warmup_optimizer_updates": plan.warmup_steps,
+        "effective_cosine_restarts": (
+            config.training.cosine_restarts if config.training.scheduler == "cosine_with_restarts" else 0
+        ),
         "save_every_epochs": plan.save_every_epochs,
         "buckets": [{"width": w, "height": h, "images": n} for (w, h), n in sorted(counts.items())],
         "mean_aspect_ratio_error": sum(
@@ -80,6 +85,8 @@ def main(argv=None):
         command.add_argument("--config", required=True, help="Training TOML; paths are relative to working directory")
         if name == "train":
             command.add_argument("--resume", help="Completed epoch-* or legacy step-* checkpoint directory")
+            command.add_argument("--new-stage", action="store_true",
+                                 help="Keep adapter/optimizer/RNG from a completed run; restart epoch/step and LR plan in a new empty output")
     args = parser.parse_args(argv)
     try:
         if args.command == "doctor":
@@ -99,7 +106,7 @@ def main(argv=None):
                 result = {"cache_directory": str(directory), "images": len(spec["records"]), "status": "valid"}
             else:
                 from .training import train
-                result = {"checkpoint": str(train(config, args.resume))}
+                result = {"checkpoint": str(train(config, args.resume, new_stage=args.new_stage))}
         print(json.dumps(result, ensure_ascii=False, indent=2))
         if args.command == "doctor" and not result["ready"]:
             return 2
