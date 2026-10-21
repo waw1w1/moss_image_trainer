@@ -4,6 +4,7 @@ from __future__ import annotations
 import functools
 import sys
 import types
+import weakref
 
 import torch
 from torch.autograd.function import once_differentiable
@@ -206,13 +207,30 @@ def _training_only_compilation(forward, compiled, block, cache_state=None):
     return wrapped
 
 
-def _offload_checkpoint_input(forward, block):
+def _cache_checkpoint_input(cache, host, events):
+    # One free buffer per block, rather than retaining every bucket's layout.
+    cache[:] = [(host, events)]
+
+
+class _PooledCheckpointInput:
+    def __init__(self, device, host, ready, cache):
+        self.device, self.host, self.ready = device, host, ready
+        self.events = [ready]
+        # Unpack can run repeatedly (including retain_graph). Recycle only when
+        # autograd releases the saved object, and never capture that object here.
+        weakref.finalize(self, _cache_checkpoint_input, cache, host, self.events)
+
+
+def _offload_checkpoint_input(forward, block, *, pool=False):
     """Move only saved aliases of this call's input, outside the compiled graph.
 
     A compiled backward also saves weight tensors. Applying save_on_cpu to the
     entire callable would copy those weights unnecessarily; identify the input
     storage instead. Capture scalar metadata, never the CUDA input itself.
+    Pool only contiguous inputs, whose copies need no CPU layout conversion.
     """
+    cache = []
+
     @functools.wraps(forward)
     def wrapped(*args, **kwargs):
         value = args[0] if args else kwargs.get("value", kwargs.get("x"))
@@ -226,24 +244,42 @@ def _offload_checkpoint_input(forward, block):
                     or (tensor.device, tensor.untyped_storage().data_ptr()) != storage):
                 # A detached handle avoids a saved-tensor/grad_fn reference cycle.
                 return tensor.detach()
-            host = torch.empty_strided(tensor.size(), tensor.stride(), dtype=tensor.dtype,
-                                       device="cpu", pin_memory=True)
             stream = torch.cuda.current_stream(tensor.device)
+            pooled = pool and tensor.is_contiguous()
+            host = None
+            if pooled and cache:
+                candidate, events = cache.pop()
+                if (candidate.size() == tensor.size() and candidate.stride() == tensor.stride()
+                        and candidate.dtype == tensor.dtype):
+                    for event in events:
+                        stream.wait_event(event)
+                    host = candidate
+            if host is None:
+                host = torch.empty_strided(tensor.size(), tensor.stride(), dtype=tensor.dtype,
+                                           device="cpu", pin_memory=True)
             host.copy_(tensor, non_blocking=True)
             tensor.record_stream(stream)
             ready = torch.cuda.Event()
             ready.record(stream)
+            if pooled:
+                return _PooledCheckpointInput(tensor.device, host, ready, cache)
             return tensor.device, host, ready
 
         def unpack(packed):
             if isinstance(packed, torch.Tensor):
                 return packed
-            device, host, ready = packed
+            pooled = isinstance(packed, _PooledCheckpointInput)
+            device, host, ready = (packed.device, packed.host, packed.ready) if pooled else packed
             # Backward may execute on a different stream. The wait stays on GPU;
             # empty_strided also preserves layouts expected by the compiled graph.
-            torch.cuda.current_stream(device).wait_event(ready)
+            stream = torch.cuda.current_stream(device)
+            stream.wait_event(ready)
             restored = torch.empty_strided(host.size(), host.stride(), dtype=host.dtype, device=device)
             restored.copy_(host, non_blocking=True)
+            if pooled:
+                # Include every H2D reader before a later D2H overwrites the host
+                # buffer, even when repeated unpack calls use different streams.
+                packed.events.append(stream.record_event())
             return restored
 
         with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
@@ -252,14 +288,17 @@ def _offload_checkpoint_input(forward, block):
     return wrapped
 
 
-def enable_compiled_checkpointing(model, *, offload=False):
+def enable_compiled_checkpointing(model, *, offload=False, offload_pool=False):
     """Install after adapters/packed execution, before any checkpoint wrapping.
 
     Only the main blocks are compiled. Native RMS reduction custom ops, explicit
     BF16 casts and separate residual gradient edges preserve the eager calculation.
     """
+    if offload_pool and not offload:
+        raise ValueError("Checkpoint offload pooling requires checkpoint offload")
     if getattr(model, '_moss_compiled', False):
-        if getattr(model, '_moss_compiled_offload', False) != offload:
+        if (getattr(model, '_moss_compiled_offload', False) != offload
+                or getattr(model, '_moss_compiled_offload_pool', False) != offload_pool):
             raise ValueError("Compiled checkpoints are already enabled with different offload settings")
         return
     if hasattr(model, '_moss_checkpoint_config'):
@@ -296,8 +335,9 @@ def enable_compiled_checkpointing(model, *, offload=False):
         # Keep hooks outside compile(checkpoint(...)). The uncompiled text blocks
         # also use input-only offload when text adapters are being trained.
         for block in [*model.layers, *model.text_embedder.blocks]:
-            block.forward = _offload_checkpoint_input(block.forward, block)
+            block.forward = _offload_checkpoint_input(block.forward, block, pool=offload_pool)
             block._moss_checkpoint_policy = ("full", True)
         model._moss_checkpoint_config = ("full", True, len(model.layers))
     model._moss_compiled_offload = offload
+    model._moss_compiled_offload_pool = offload_pool
     model._moss_compiled = True

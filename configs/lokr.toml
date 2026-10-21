@@ -78,7 +78,7 @@ dora_wd = false
 [training]
 # 示例总轮数，训练前自行填写；1 epoch 遍历含重复次数的全部分桶批次。
 max_epochs = 20
-# 优化器可选：adamw（默认）、adam、sgd（momentum=0.9）、rmsprop；其余参数使用 PyTorch 默认值。
+# 优化器可选：adamw（默认）、adamw_fused、adam、sgd（momentum=0.9）、rmsprop。
 optimizer = "adamw"
 # 学习率调度可选：constant（预热后恒定）、linear（线性下降）、cosine（余弦下降）、
 # cosine_with_restarts（余弦下降并重启）；默认 cosine 不重启。
@@ -134,6 +134,8 @@ fused_rmsnorm = true
 compile_blocks = true
 # 将检查点输入激活暂存 CPU 固定内存，反向时传回 GPU；节省显存，有少量传输开销。
 checkpoint_offload = true
+# 复用已释放检查点的 pinned 输入缓冲；需 compile_blocks 和 checkpoint_offload，默认关闭。
+checkpoint_offload_pool = false
 
 # 训练预览：固定 50 步，使用 training.seed 作为固定噪声种子，便于比较各 epoch。
 [sample]

@@ -72,6 +72,7 @@ class Training:
     fused_rmsnorm: bool = False
     compile_blocks: bool = False
     checkpoint_offload: bool = False
+    checkpoint_offload_pool: bool = False
     checkpoint_blocks: int = -1
     optimizer: str = "adamw"
     scheduler: str = "cosine"
@@ -132,7 +133,8 @@ def _expand_option_groups(raw: dict) -> None:
         },
         "optimization": {
             name: ("training", name)
-            for name in ("fused_situ", "fused_rmsnorm", "compile_blocks", "checkpoint_offload")
+            for name in ("fused_situ", "fused_rmsnorm", "compile_blocks", "checkpoint_offload",
+                         "checkpoint_offload_pool")
         },
     }
     for group, aliases in groups.items():
@@ -290,6 +292,8 @@ def validate(c: Config) -> None:
         raise ValueError("checkpoint_policy='attention' requires gradient_checkpointing=true")
     if t.checkpoint_offload and not t.gradient_checkpointing:
         raise ValueError("checkpoint_offload requires gradient_checkpointing=true")
+    if t.checkpoint_offload_pool and not (t.compile_blocks and t.checkpoint_offload):
+        raise ValueError("checkpoint_offload_pool requires compile_blocks=true and checkpoint_offload=true")
     if t.checkpoint_blocks != -1 and not 1 <= t.checkpoint_blocks <= 42:
         raise ValueError("checkpoint_blocks must be -1 (all) or between 1 and 42")
     if t.checkpoint_blocks != -1 and not t.gradient_checkpointing:
@@ -298,8 +302,8 @@ def validate(c: Config) -> None:
         n.algo == "dylora" or n.dropout or n.rank_dropout or n.module_dropout
     ):
         raise ValueError("Packed BS>1 requires deterministic adapters: disable adapter dropout and DyLoRA, or use batch_mode='sequential'")
-    if t.optimizer not in ("adamw", "adam", "sgd", "rmsprop"):
-        raise ValueError("optimizer must be adamw, adam, sgd or rmsprop")
+    if t.optimizer not in ("adamw", "adamw_fused", "adam", "sgd", "rmsprop"):
+        raise ValueError("optimizer must be adamw, adamw_fused, adam, sgd or rmsprop")
     if t.scheduler not in ("constant", "linear", "cosine", "cosine_with_restarts"):
         raise ValueError("scheduler must be constant, linear, cosine or cosine_with_restarts")
     if not 0 <= t.warmup_ratio <= 1 or t.cosine_restarts < 0:

@@ -110,7 +110,8 @@ def train(config: Config, resume=None, *, new_stage=False):
     network.train()
     if config.training.compile_blocks:
         from .compilation import enable_compiled_checkpointing
-        enable_compiled_checkpointing(model, offload=config.training.checkpoint_offload)
+        enable_compiled_checkpointing(model, offload=config.training.checkpoint_offload,
+                                      offload_pool=config.training.checkpoint_offload_pool)
     elif config.training.gradient_checkpointing:
         enable_checkpointing(model, config.training.checkpoint_policy,
                              offload=config.training.checkpoint_offload,

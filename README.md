@@ -87,7 +87,9 @@ vae = "models/vae/moss_image_vae_fp32.safetensors"
 
 `max_epochs` 控制训练轮数，`save_every_epochs` 控制保存间隔，最后一轮始终保存。1 epoch 遍历含重复次数的全部分桶批次；`warmup_ratio` 按一个 epoch 的比例指定预热：0.3 表示首轮前 30%，乘以每轮优化器更新次数后向上取整，只预热一次。满批有效批大小为 `batch_size × gradient_accumulation_steps`，桶尾与轮尾按实际图片数归一化。
 
-优化器通过 `training.optimizer` 选择 `adamw`（默认）、`adam`、`sgd`（momentum=0.9）或 `rmsprop`。学习率调度通过 `training.scheduler` 选择 `constant`、`linear`、`cosine`（默认）或 `cosine_with_restarts`；全部先执行一次预热。`cosine_restarts` 是预热后的额外重启次数，仅最后一种调度生效，0 表示不重启。保留旧 `warmup_steps` 配置兼容，未指定调度器的旧文件继续采用预热后恒定学习率；新旧预热字段不能同时填写。
+优化器通过 `training.optimizer` 选择 `adamw`（默认）、`adamw_fused`、`adam`、`sgd`（momentum=0.9）或 `rmsprop`。`adamw_fused` 使用原生 PyTorch `AdamW(fused=True)`，保持现有梯度累积、当步全局裁剪与更新顺序，减少优化器的逐参数执行开销；浮点结果不保证与普通 AdamW 逐位一致，实际收益取决于优化器耗时占比。
+
+学习率调度通过 `training.scheduler` 选择 `constant`、`linear`、`cosine`（默认）或 `cosine_with_restarts`；全部先执行一次预热。`cosine_restarts` 是预热后的额外重启次数，仅最后一种调度生效，0 表示不重启。保留旧 `warmup_steps` 配置兼容，未指定调度器的旧文件继续采用预热后恒定学习率；新旧预热字段不能同时填写。
 
 LoKr 示例默认 `full_matrix=true`、`train_norm=true`、`factor=8`，训练完整 Kronecker 因子和 RMSNorm 增量。LoRA 示例默认 `train_text_projection=true`，同时适配 DiT 内部文本投影和两层文本细化；Qwen 保持冻结。
 
@@ -96,6 +98,10 @@ LoKr 示例默认 `full_matrix=true`、`train_norm=true`、`factor=8`，训练�
 ## 显存与编译
 
 两个示例默认开启双融合、全部梯度检查点、编译与 CPU 检查点卸载。卸载的是激活，不是模型权重；会增加主存占用和数据传输。首次运行或遇到新尺寸时需要编译。
+
+可选 `[optimization].checkpoint_offload_pool=true` 复用已释放检查点的连续输入 pinned CPU 缓冲，要求同时启用 `compile_blocks` 与 `checkpoint_offload`，默认关闭；非连续输入沿用原卸载路径。每个 block 最多保留一个空闲缓冲，只有形状、步幅和 dtype 相同才复用；图释放前不归还，复用前等待该缓冲的复制事件。它减少缓冲申请次数，不减少卸载字节或传输量，也不直接节省显存；PyTorch 本身已有 pinned allocator 缓存，新增事件也有开销，因此吞吐收益需要在目标 GPU 上对照验证。
+
+这两个可选项参考 KohakuMossTrainer 报告中的优化方向，使用现有卸载路径和 PyTorch 公共 API 实现。先在新训练中单独比较，再组合启用。普通 AdamW 与 `adamw_fused`、不同 pool 设置不能互相切换后直接续训；`--new-stage` 也保留这些执行设置。未启用新选项时保留旧检查点签名。
 
 `compile_blocks=true` 要求：
 

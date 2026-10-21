@@ -48,12 +48,14 @@ def checkpoint_name(config, step, next_epoch, next_batch):
 
 
 def build_optimizer(parameters, training):
-    """Use native PyTorch optimizers; keep AdamW's existing defaults."""
+    """Use native PyTorch optimizers; opt into fused AdamW explicitly."""
     import torch
-    classes = {"adamw": torch.optim.AdamW, "adam": torch.optim.Adam,
+    classes = {"adamw": torch.optim.AdamW, "adamw_fused": torch.optim.AdamW, "adam": torch.optim.Adam,
                "sgd": torch.optim.SGD, "rmsprop": torch.optim.RMSprop}
     options = {"lr": training.learning_rate, "weight_decay": training.weight_decay,
                "foreach": False}
+    if training.optimizer == "adamw_fused":
+        options["fused"] = True
     if training.optimizer == "sgd":
         options["momentum"] = 0.9
     return classes[training.optimizer](parameters, **options)

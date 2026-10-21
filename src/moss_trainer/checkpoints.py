@@ -53,7 +53,7 @@ def _resume_signature(config, cache_fingerprint):
         values["training"].pop("fused_situ")
     if values["training"]["checkpoint_policy"] == "full":
         values["training"].pop("checkpoint_policy")
-    for field in ("fused_rmsnorm", "checkpoint_offload", "compile_blocks"):
+    for field in ("fused_rmsnorm", "checkpoint_offload", "compile_blocks", "checkpoint_offload_pool"):
         if not values["training"][field]:
             values["training"].pop(field)
     if values["training"]["checkpoint_blocks"] == -1:
