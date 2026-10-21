@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from statistics import NormalDist
 from pathlib import Path
 import tomllib
 from typing import get_type_hints
@@ -27,7 +28,6 @@ class Dataset:
     bucket_reso_steps: int = 64
     bucket_no_upscale: bool = True
     batch_size: int = 1
-    num_repeats: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,6 +62,7 @@ class Training:
     max_steps: int = 1000
     max_epochs: int = 0
     learning_rate: float = 1e-4
+    min_learning_rate: float = 0.0
     weight_decay: float = 0.01
     gradient_accumulation_steps: int = 4
     batch_mode: str = "packed"
@@ -70,10 +71,16 @@ class Training:
     checkpoint_policy: str = "full"
     fused_situ: bool = False
     fused_rmsnorm: bool = False
-    compile_blocks: bool = False
     checkpoint_offload: bool = False
     checkpoint_blocks: int = -1
     optimizer: str = "adamw"
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = True
+    muon_ns_steps: int = 5
+    muon_adjust_lr: str = "match_rms_adamw"
+    hybrid_adam_beta1: float = 0.9
+    hybrid_adam_beta2: float = 0.95
+    hybrid_adam_eps: float = 1e-8
     scheduler: str = "cosine"
     cosine_restarts: int = 0
     warmup_ratio: float = 0.3
@@ -83,11 +90,24 @@ class Training:
     seed: int = 42
     timestep_sampling: str = "logit_normal"
     logit_mean: float = 0.0
+    low_noise_ratio: float | None = None
     logit_std: float = 1.0
     timestep_shift: float = 1.0
     caption_dropout: float = 0.1
     num_workers: int = 0
     tensorboard: bool = False
+
+    @property
+    def effective_logit_mean(self) -> float:
+        """Invert P(round(1000 * shifted_sigma) < 500), preserving legacy draws."""
+        if self.low_noise_ratio is None:
+            return self.logit_mean
+        boundary = math.log(0.4995 / 0.5005) - math.log(self.timestep_shift)
+        normal = NormalDist()
+        current = normal.cdf((boundary - self.logit_mean) / self.logit_std)
+        if math.isclose(self.low_noise_ratio, current, rel_tol=0, abs_tol=1e-15):
+            return self.logit_mean
+        return boundary - self.logit_std * normal.inv_cdf(self.low_noise_ratio)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -132,7 +152,7 @@ def _expand_option_groups(raw: dict) -> None:
         },
         "optimization": {
             name: ("training", name)
-            for name in ("fused_situ", "fused_rmsnorm", "compile_blocks", "checkpoint_offload")
+            for name in ("fused_situ", "fused_rmsnorm", "checkpoint_offload")
         },
     }
     for group, aliases in groups.items():
@@ -228,8 +248,8 @@ def validate(c: Config) -> None:
         raise ValueError("Invalid bucket minimum/maximum resolution")
     if any(x % d.bucket_reso_steps for x in (d.min_bucket_reso, d.max_bucket_reso)):
         raise ValueError("min/max_bucket_reso must be multiples of bucket_reso_steps")
-    if d.batch_size < 1 or d.num_repeats < 1:
-        raise ValueError("batch_size and num_repeats must be positive")
+    if d.batch_size < 1:
+        raise ValueError("batch_size must be positive")
     if not d.caption_extension.startswith("."):
         raise ValueError("caption_extension must start with a dot")
     if not 1 <= c.cache.max_sequence_length <= 4096:
@@ -264,28 +284,12 @@ def validate(c: Config) -> None:
         raise ValueError("Legacy step scheduling requires positive max_steps/save_every and save_every_epochs=0")
     if t.learning_rate <= 0 or t.gradient_accumulation_steps < 1:
         raise ValueError("learning_rate and gradient_accumulation_steps must be positive")
+    if not 0 <= t.min_learning_rate <= t.learning_rate:
+        raise ValueError("min_learning_rate must be between 0 and learning_rate")
     if t.batch_mode not in ("packed", "sequential"):
         raise ValueError("batch_mode must be packed or sequential")
     if t.checkpoint_policy not in ("full", "attention"):
         raise ValueError("checkpoint_policy must be full or attention")
-    if t.compile_blocks:
-        if not (t.gradient_checkpointing and t.fused_situ and t.fused_rmsnorm):
-            raise ValueError("compile_blocks requires gradient_checkpointing, fused_situ and fused_rmsnorm")
-        if t.checkpoint_policy != "full" or t.checkpoint_blocks != -1:
-            raise ValueError("compile_blocks requires all full checkpoints")
-        if (n.algo not in ("lora", "locon", "lokr") or n.dora_wd
-                or n.dropout or n.rank_dropout or n.module_dropout):
-            raise ValueError("compile_blocks currently supports LoRA/LoKr without dropout or weight decomposition")
-        if n.algo == "lokr":
-            if n.factor != 8 or n.decompose_both or n.use_tucker:
-                raise ValueError("Compiled LoKr requires factor=8 without decompose_both/use_tucker")
-            # Official targets' largest factor has width 16384 / 8 = 2048.
-            # LyCORIS uses complete factors once dim reaches half that width.
-            complete_factors = n.full_matrix or n.dim >= 1024
-            if not complete_factors and (n.dim != 16 or n.alpha != 16):
-                raise ValueError("Compiled low-rank LoKr requires dim=alpha=16; use full_matrix=true for full factors")
-        elif n.dim != 16 or n.alpha != 16:
-            raise ValueError("Compiled LoRA/LoCon requires dim=alpha=16")
     if not t.gradient_checkpointing and t.checkpoint_policy != "full":
         raise ValueError("checkpoint_policy='attention' requires gradient_checkpointing=true")
     if t.checkpoint_offload and not t.gradient_checkpointing:
@@ -298,8 +302,16 @@ def validate(c: Config) -> None:
         n.algo == "dylora" or n.dropout or n.rank_dropout or n.module_dropout
     ):
         raise ValueError("Packed BS>1 requires deterministic adapters: disable adapter dropout and DyLoRA, or use batch_mode='sequential'")
-    if t.optimizer not in ("adamw", "adam", "sgd", "rmsprop"):
-        raise ValueError("optimizer must be adamw, adam, sgd or rmsprop")
+    if t.optimizer not in ("adamw", "adam", "sgd", "rmsprop", "muon_adamw"):
+        raise ValueError("optimizer must be adamw, adam, sgd, rmsprop or muon_adamw")
+    if not 0 <= t.muon_momentum < 1 or t.muon_ns_steps < 1:
+        raise ValueError("Muon requires momentum in [0, 1) and positive ns_steps")
+    if t.muon_adjust_lr != "match_rms_adamw":
+        raise ValueError("muon_adjust_lr must be match_rms_adamw")
+    if not (0 <= t.hybrid_adam_beta1 < 1 and 0 <= t.hybrid_adam_beta2 < 1) or t.hybrid_adam_eps <= 0:
+        raise ValueError("Hybrid AdamW requires betas in [0, 1) and positive eps")
+    if t.optimizer == "muon_adamw" and n.algo not in ("lora", "lokr"):
+        raise ValueError("muon_adamw currently supports lora and lokr only")
     if t.scheduler not in ("constant", "linear", "cosine", "cosine_with_restarts"):
         raise ValueError("scheduler must be constant, linear, cosine or cosine_with_restarts")
     if not 0 <= t.warmup_ratio <= 1 or t.cosine_restarts < 0:
@@ -310,6 +322,11 @@ def validate(c: Config) -> None:
         raise ValueError("timestep_sampling must be uniform or logit_normal")
     if t.timestep_shift <= 0 or t.logit_std <= 0:
         raise ValueError("timestep_shift and logit_std must be positive")
+    if t.low_noise_ratio is not None:
+        if type(t.low_noise_ratio) not in (int, float) or not 0 < t.low_noise_ratio < 1:
+            raise ValueError("low_noise_ratio must be a number strictly between 0 and 1")
+        if t.timestep_sampling != "logit_normal":
+            raise ValueError("low_noise_ratio requires timestep_sampling='logit_normal'")
     if c.sample.every_epochs < 0 or c.sample.cfg < 0:
         raise ValueError("sample.every_epochs and sample.cfg must be nonnegative")
     if (not isinstance(c.sample.resolution, (tuple, list)) or len(c.sample.resolution) != 2

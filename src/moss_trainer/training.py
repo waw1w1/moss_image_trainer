@@ -29,7 +29,7 @@ def sample_flow_batch(latents, config, generator=None):
         sigma = torch.rand(batch, device=device, dtype=torch.float32, generator=generator)
     else:
         normal = torch.randn(batch, device=device, dtype=torch.float32, generator=generator)
-        sigma = torch.sigmoid(normal * config.logit_std + config.logit_mean)
+        sigma = torch.sigmoid(normal * config.logit_std + config.effective_logit_mean)
     sigma = config.timestep_shift * sigma / (1 + (config.timestep_shift - 1) * sigma)
     # Match the official model's 1000-point training time grid.
     timestep = (sigma * 1000).round().clamp(1, 1000)
@@ -73,7 +73,7 @@ def train(config: Config, resume=None, *, new_stage=False):
     require_cuda()
     spec, cache_directory = verify_cache(config)
     records = spec["records"]
-    sampler = BucketBatchSampler(records, config.dataset.batch_size, config.dataset.num_repeats, config.training.seed)
+    sampler = BucketBatchSampler(records, config.dataset.batch_size, config.training.seed)
     batch_count = sampler.total_batches
     plan = training_plan(config.training, batch_count)
     state = load_checkpoint(resume, config, spec, batch_count=batch_count, new_stage=new_stage) if resume else None
@@ -108,15 +108,12 @@ def train(config: Config, resume=None, *, new_stage=False):
     text_directory = prepare_refined_text(model, config, spec, cache_directory)
     model.train()
     network.train()
-    if config.training.compile_blocks:
-        from .compilation import enable_compiled_checkpointing
-        enable_compiled_checkpointing(model, offload=config.training.checkpoint_offload)
-    elif config.training.gradient_checkpointing:
+    if config.training.gradient_checkpointing:
         enable_checkpointing(model, config.training.checkpoint_policy,
                              offload=config.training.checkpoint_offload,
                              blocks=config.training.checkpoint_blocks)
     parameters = [p for p in network.parameters() if p.requires_grad]
-    optimizer = build_optimizer(parameters, config.training)
+    optimizer = build_optimizer(parameters, config.training, named_parameters=network.named_parameters())
     scheduler = build_scheduler(optimizer, config.training, plan)
     dataset = CachedDataset(records, cache_directory, text_directory=text_directory)
     # A private DataLoader RNG leaves model/dropout RNG unchanged when resuming.
@@ -169,6 +166,7 @@ def train(config: Config, resume=None, *, new_stage=False):
                         parameter.grad.div_(sample_count)
                 grad_norm = torch.nn.utils.clip_grad_norm_(parameters, config.training.max_grad_norm, error_if_nonfinite=True)
                 update_learning_rate = optimizer.param_groups[0]["lr"]
+                group_lrs = {g["algorithm"]: g["lr"] for g in optimizer.param_groups if "algorithm" in g}
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -183,9 +181,11 @@ def train(config: Config, resume=None, *, new_stage=False):
                     "peak_allocated_gib": round(torch.cuda.max_memory_allocated() / 2**30, 3),
                     "peak_reserved_gib": round(torch.cuda.max_memory_reserved() / 2**30, 3),
                 }
+                statistics.update({f"lr_{role}": lr for role, lr in group_lrs.items()})
                 print(json.dumps(statistics), flush=True)
                 update_seconds = time.monotonic() - update_started
                 telemetry.scalars(step, {
+                    **{f"train/learning_rate_{role}": lr for role, lr in group_lrs.items()},
                     "train/loss": statistics["loss"], "train/learning_rate": statistics["lr"],
                     "train/grad_norm": statistics["grad_norm"], "train/epoch": epoch + (batch_index + 1) / batch_count,
                     "performance/update_seconds": update_seconds,

@@ -35,8 +35,6 @@ bucket_reso_steps = 64
 bucket_no_upscale = true
 # 每次前向、反向处理的图片数；增大会提高显存需求。
 batch_size = 1
-# 每轮数据集中每张图片的重复次数。
-num_repeats = 1
 
 # 数据集缓存设置：控制文本特征的长度上限。
 [cache]
@@ -51,43 +49,60 @@ algo = "lokr"
 dim = 16
 # 低秩模式的缩放系数；全维度模式由 LyCORIS 使用单位缩放，无需把 alpha 调到超大。
 alpha = 16.0
-# LoKr 的 Kronecker 维度分解因子；当前编译路径要求为 8。
+# LoKr 的 Kronecker 维度分解因子。
 factor = 8
-# 直接启用完整 Kronecker 因子矩阵，等效于足够大的 dim/alpha 触发的全维度模式，可与编译同时开启。
+# 直接启用完整 Kronecker 因子矩阵，等效于足够大的 dim/alpha 触发的全维度模式。
 full_matrix = true
-# 是否尝试同时低秩分解两个 Kronecker 因子；当前编译路径要求关闭。
+# 是否尝试同时低秩分解两个 Kronecker 因子。
 decompose_both = false
 # attention-mlp 训练注意力和前馈线性层；attention 只选注意力线性层。
 target = "attention-mlp"
 # 是否额外适配 DiT 文本投影及两层文本细化；false 冻结它们，允许预缓存细化结果。
 train_text_projection = false
-# 训练主干和输出层的 RMSNorm 权重增量；文本细化的 Norm 随 train_text_projection 开关，可与融合/编译/卸载组合。
+# 训练主干和输出层的 RMSNorm 权重增量；文本细化的 Norm 随 train_text_projection 开关，可与融合/卸载组合。
 train_norm = true
 # 普通 dropout 概率；当前 LoKr 不支持非零值，保持为 0。
 dropout = 0.0
-# LoKr 重建权重时随机屏蔽输出通道的概率；0 为关闭，当前编译路径要求为 0。
+# LoKr 重建权重时随机屏蔽输出通道的概率；0 为关闭。
 rank_dropout = 0.0
-# 随机跳过整个适配器分支的概率；0 为关闭，当前编译路径要求为 0。
+# 随机跳过整个适配器分支的概率；0 为关闭。
 module_dropout = 0.0
 # DyLoRA 的秩分块大小；当前 lokr 算法不使用此参数。
 block_size = 4
-# 是否使用权重分解式适配；当前编译路径要求关闭。
+# 是否使用权重分解式适配。
 dora_wd = false
 
 # 训练设置：控制优化器、梯度累积、检查点、噪声采样和保存频率。
 [training]
 # 示例总轮数，训练前自行填写；1 epoch 遍历含重复次数的全部分桶批次。
 max_epochs = 20
-# 优化器可选：adamw（默认）、adam、sgd（momentum=0.9）、rmsprop；其余参数使用 PyTorch 默认值。
+# 优化器可选：adamw（默认）、muon_adamw（Muon + AdamW 混合，仅支持 LoRA/LoKr）、adam、sgd（momentum=0.9）、rmsprop。
 optimizer = "adamw"
+# 混合优化器仅支持 LoRA/LoKr；以下参数只在 muon_adamw 时生效，原 AdamW 行为不变。
+# 两组共用 learning_rate、min_learning_rate 和预热/调度；Muon 用 RMS matching 缩放。
+muon_momentum = 0.95
+muon_nesterov = true
+muon_ns_steps = 5
+# 当前固定使用 match_rms_adamw，避免原版 Muon 学习率尺度不同。
+muon_adjust_lr = "match_rms_adamw"
+# 混合分支的 AdamW 参数；独立 adamw 仍使用 PyTorch 默认 betas=(0.9, 0.999)。
+hybrid_adam_beta1 = 0.9
+hybrid_adam_beta2 = 0.95
+hybrid_adam_eps = 1e-8
+# Muon 更新适配器矩阵；Norm/DoRA缩放/标量由 AdamW 更新且不做权重衰减。
+# 换优化器必须新开训练，不能通过 --resume 或 --new-stage 沿用另一种优化器状态。
 # 学习率调度可选：constant（预热后恒定）、linear（线性下降）、cosine（余弦下降）、
 # cosine_with_restarts（余弦下降并重启）；默认 cosine 不重启。
 scheduler = "cosine"
 # 仅 cosine_with_restarts 生效；表示额外重启次数，2 = 3 个等长余弦周期；0 = 不重启。
 # 重启仅重置学习率，不清空优化器状态，也不重复预热；其他 scheduler 忽略此项。
 cosine_restarts = 0
-# 预热结束时的目标学习率；随后按 scheduler 变化，下降型调度在训练结束时降至 0。
+# 预热结束时的目标学习率，也是每个余弦周期的峰值。
 learning_rate = 0.0001
+# 仅 cosine / cosine_with_restarts 生效：余弦下降下限，训练结束时达到；默认 0。
+# 使用绝对学习率，范围 0 <= min_learning_rate <= learning_rate；例如 0.00001。
+# 重启仍回到 learning_rate；预热不受此下限限制，constant / linear 忽略此项。
+min_learning_rate = 0.0
 # 优化器权重衰减系数；AdamW 使用解耦衰减，其余优化器使用各自原生实现。
 weight_decay = 0.01
 # 累积多少个微批次后更新一次参数；当前满批有效批大小为 1 × 4 = 4。
@@ -98,9 +113,9 @@ batch_mode = "packed"
 max_grad_norm = 1.0
 # 启用梯度检查点，通过反向时重算前向来降低激活显存。
 gradient_checkpointing = true
-# full 重算完整块；attention 保留注意力结果以减少重算；当前编译路径要求 full。
+# full 重算完整块；attention 保留注意力结果以减少重算。
 checkpoint_policy = "full"
-# -1 为全部 42 个主干块启用检查点；当前编译路径要求全部启用。
+# -1 为全部 42 个主干块启用检查点。
 checkpoint_blocks = -1
 # 预热占一个 epoch 的比例，范围 0~1；0.3 = 第一个 epoch 的前 30%，0 = 不预热。
 # 按每轮优化器更新次数（已考虑梯度累积）向上取整；只在训练开始时预热一次。
@@ -111,7 +126,10 @@ save_every_epochs = 1
 seed = 42
 # 训练时间步分布；logit_normal 使用 sigmoid 映射的正态采样，也可选 uniform。
 timestep_sampling = "logit_normal"
-# logit_normal 采样时的正态分布均值；uniform 时不使用。
+# 低噪声（sigma < 0.5）的目标比例；0.60 表示 60%，必须大于 0 且小于 1。
+# 默认约 49.92%，保持原采样；仅支持 logit_normal，填写后覆盖 logit_mean。
+low_noise_ratio = 0.4992021157051587
+# 未填写 low_noise_ratio 时使用的正态分布均值；uniform 时不使用。
 logit_mean = 0.0
 # logit_normal 采样时的正态分布标准差；uniform 时不使用。
 logit_std = 1.0
@@ -124,14 +142,12 @@ num_workers = 0
 # 后台进程记录 TensorBoard 指标和预览；异常或日志队列满不会中断或阻塞训练。
 tensorboard = true
 
-# 特殊优化：融合计算、编译和 CPU 检查点卸载；续训时沿用断点的执行设置。
+# 特殊优化：融合计算和 CPU 检查点卸载；续训时沿用断点的执行设置。
 [optimization]
 # 融合 SITU 激活的前向、反向运算，减少内核开销并保留 BF16 中间舍入。
 fused_situ = true
 # 融合 RMSNorm 的逐元素运算，保留原 FP32 归约和两条梯度路径。
 fused_rmsnorm = true
-# 编译主干块与检查点以提速；依赖上述双融合和全部 full 检查点，首次运行需编译。
-compile_blocks = true
 # 将检查点输入激活暂存 CPU 固定内存，反向时传回 GPU；节省显存，有少量传输开销。
 checkpoint_offload = true
 

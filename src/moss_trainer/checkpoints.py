@@ -23,6 +23,18 @@ PAYLOAD_FILES = ("adapter.safetensors", "trainer-state.pt", "config.json")
 
 def _resume_signature(config, cache_fingerprint):
     values = config.as_dict()
+    # Hybrid-only knobs must not invalidate existing conventional checkpoints.
+    if config.training.optimizer != "muon_adamw":
+        from .optimizers import HYBRID_FIELDS
+        for name in HYBRID_FIELDS:
+            values["training"].pop(name)
+    # Sign the effective distribution, preserving legacy/default checkpoint hashes.
+    values["training"].pop("low_noise_ratio")
+    values["training"]["logit_mean"] = config.training.effective_logit_mean
+    # Zero retains the previous schedule signature; other schedulers ignore it.
+    if (config.training.min_learning_rate == 0
+            or config.training.scheduler not in ("cosine", "cosine_with_restarts")):
+        values["training"].pop("min_learning_rate")
     # Decaying schedules depend on the original horizon; reject duration changes.
     schedule_horizon = (
         {"max_steps": config.training.max_steps, "max_epochs": config.training.max_epochs}
@@ -53,7 +65,7 @@ def _resume_signature(config, cache_fingerprint):
         values["training"].pop("fused_situ")
     if values["training"]["checkpoint_policy"] == "full":
         values["training"].pop("checkpoint_policy")
-    for field in ("fused_rmsnorm", "checkpoint_offload", "compile_blocks"):
+    for field in ("fused_rmsnorm", "checkpoint_offload"):
         if not values["training"][field]:
             values["training"].pop(field)
     if values["training"]["checkpoint_blocks"] == -1:
@@ -173,7 +185,8 @@ def load_checkpoint(directory, config, spec, *, batch_count, new_stage=False):
         if new_stage:
             # Only the learning-rate plan may change; optimizer and data remain strict.
             saved = json.loads((directory / "config.json").read_text(encoding="utf-8"))["training"]
-            schedule_fields = ("learning_rate", "scheduler", "cosine_restarts",
+            saved.setdefault("min_learning_rate", 0.0)
+            schedule_fields = ("learning_rate", "min_learning_rate", "scheduler", "cosine_restarts",
                                "warmup_steps", "warmup_ratio", "max_steps", "max_epochs")
             validation_config = dataclasses.replace(
                 config, training=dataclasses.replace(
@@ -237,7 +250,7 @@ def restore_checkpoint(directory, state, network, optimizer, scheduler, *, new_s
     fresh_base_lrs = list(scheduler.base_lrs)
     optimizer.load_state_dict(state["optimizer"])
     if new_stage:
-        # Preserve Adam moments and per-parameter steps, but use the fresh schedule.
+        # Preserve optimizer moments and per-parameter steps, but use the fresh schedule.
         for group, lr, base_lr in zip(optimizer.param_groups, fresh_lrs, fresh_base_lrs):
             group["lr"], group["initial_lr"] = lr, base_lr
     else:

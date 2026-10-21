@@ -50,10 +50,14 @@ def bucket_summary(config):
     from .scheduling import training_plan
     records = scan_dataset(config)
     counts = Counter(tuple(record["bucket"]) for record in records)
-    batches = BucketBatchSampler(records, config.dataset.batch_size, config.dataset.num_repeats, config.training.seed).total_batches
+    samples = Counter()
+    for record in records:
+        samples[tuple(record["bucket"])] += record["repeats"]
+    batches = BucketBatchSampler(records, config.dataset.batch_size, config.training.seed).total_batches
     plan = training_plan(config.training, batches)
     return {
-        "images": len(records), "repeats": config.dataset.num_repeats,
+        "images": len(records), "samples_per_epoch": sum(samples.values()),
+        "repeat_distribution": dict(sorted(Counter(r["repeats"] for r in records).items())),
         "batches_per_epoch": batches, "optimizer_updates_per_epoch": plan.updates_per_epoch,
         "max_epochs": plan.max_epochs, "total_optimizer_updates": plan.max_steps,
         "optimizer": config.training.optimizer, "scheduler": config.training.scheduler,
@@ -62,7 +66,10 @@ def bucket_summary(config):
             config.training.cosine_restarts if config.training.scheduler == "cosine_with_restarts" else 0
         ),
         "save_every_epochs": plan.save_every_epochs,
-        "buckets": [{"width": w, "height": h, "images": n} for (w, h), n in sorted(counts.items())],
+        "buckets": [
+            {"width": w, "height": h, "images": n, "samples_per_epoch": samples[(w, h)]}
+            for (w, h), n in sorted(counts.items())
+        ],
         "mean_aspect_ratio_error": sum(
             abs(r["original_size"][0] / r["original_size"][1] - r["bucket"][0] / r["bucket"][1])
             for r in records
@@ -73,7 +80,7 @@ def bucket_summary(config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="MOSS-Image LoRA/LyCORIS trainer (explicit subcommands)")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("doctor", help="Verify imports, TensorBoard, CUDA, attention, Triton compilation and tiny backward; no training")
+    commands.add_parser("doctor", help="Verify imports, TensorBoard, CUDA, attention, fused kernels and tiny backward; no training")
     for name, help_text in (
         ("inspect", "Inspect model structure and adapter targets without loading weights"),
         ("buckets", "Plan kohya-style buckets without loading a model"),

@@ -153,38 +153,6 @@ def _rms_square(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(Y + i, x * x, i < N)
 
 
-@torch.library.custom_op("moss_trainer::rms_statistics", mutates_args=())
-def _rms_statistics(square: torch.Tensor) -> torch.Tensor:
-    # An opaque boundary keeps Inductor from changing the native reduction tree.
-    return torch.rsqrt(square.mean(-1, keepdim=True) + 1e-6)
-
-
-@_rms_statistics.register_fake
-def _rms_statistics_fake(square):
-    return square.new_empty((*square.shape[:-1], 1))
-
-
-@torch.library.custom_op("moss_trainer::rms_reduction", mutates_args=())
-def _rms_reduction(product: torch.Tensor, inv_rms: torch.Tensor) -> torch.Tensor:
-    return (-0.5 * product.sum(-1, keepdim=True) * inv_rms.pow(3)) / product.shape[-1]
-
-
-@_rms_reduction.register_fake
-def _rms_reduction_fake(product, inv_rms):
-    return torch.empty_like(inv_rms)
-
-
-@torch.library.custom_op("moss_trainer::rms_weight_reduction", mutates_args=())
-def _rms_weight_reduction(product: torch.Tensor) -> torch.Tensor:
-    axes = tuple(range(product.ndim - 1))
-    return product.sum(axes) if axes else product.clone()
-
-
-@_rms_weight_reduction.register_fake
-def _rms_weight_reduction_fake(product):
-    return product.new_empty((product.shape[-1],))
-
-
 @triton.jit
 def _rms_weight_product(X, R, D, P, N: tl.constexpr, C: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -235,8 +203,7 @@ class _RMSNorm(torch.autograd.Function):
             _rms_square[grid](statistics_value, square, value.numel(), 512, enable_fp_fusion=False)
             # Keep native reductions and their order, rather than substituting
             # a different Triton reduction tree for mean/sum.
-            inv_rms = (_rms_statistics(square) if torch.compiler.is_compiling()
-                       else torch.rsqrt(square.mean(-1, keepdim=True) + 1e-6))
+            inv_rms = torch.rsqrt(square.mean(-1, keepdim=True) + 1e-6)
             output = torch.empty_like(value)
             _rms_forward[grid](value, weight, inv_rms, output, value.numel(),
                                value.shape[-1], 512, enable_fp_fusion=False)
@@ -253,8 +220,7 @@ class _RMSNorm(torch.autograd.Function):
             product = torch.empty_like(value, dtype=torch.float32)
             _rms_product[grid](value, weight, gradient, product, value.numel(),
                                value.shape[-1], 512, enable_fp_fusion=False)
-            grad_square = (_rms_reduction(product, inv_rms) if torch.compiler.is_compiling()
-                           else (-0.5 * product.sum(-1, keepdim=True) * inv_rms.pow(3)) / value.shape[-1])
+            grad_square = (-0.5 * product.sum(-1, keepdim=True) * inv_rms.pow(3)) / value.shape[-1]
             direct = torch.empty_like(value)
             statistics = torch.empty_like(statistics_value)
             _rms_backward[grid](statistics_value, weight, inv_rms, grad_square, gradient,
@@ -266,8 +232,7 @@ class _RMSNorm(torch.autograd.Function):
                 _rms_weight_product[grid](value, inv_rms, gradient, weight_product,
                                           value.numel(), value.shape[-1], 512, enable_fp_fusion=False)
                 axes = tuple(range(value.ndim - 1))
-                weight_gradient = (_rms_weight_reduction(weight_product) if torch.compiler.is_compiling()
-                                   else weight_product.sum(axes) if axes else weight_product)
+                weight_gradient = weight_product.sum(axes) if axes else weight_product
         return direct, statistics, weight_gradient
 
 

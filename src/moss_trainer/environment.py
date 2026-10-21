@@ -41,7 +41,7 @@ def _attention_check():
     _require(torch.isfinite(value.grad).all().item(), "Packed attention gradient is not finite")
 
 
-def _compile_check():
+def _fused_backward_check():
     import torch
     from torch.utils.checkpoint import checkpoint
     from .kernels import fused_rmsnorm, fused_situ
@@ -56,18 +56,14 @@ def _compile_check():
     value = torch.randn(1, 16, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     norm = torch.ones(128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    compiled = torch.compile(forward, fullgraph=True, dynamic=True, options={
-        "emulate_precision_casts": True, "shape_padding": False,
-        "comprehensive_padding": False, "max_autotune_gemm_backends": "ATEN",
-    })
     # Also exercise checkpoint activation transfer without updating any parameter.
     with torch.autograd.graph.save_on_cpu(pin_memory=True):
-        loss = compiled(value, weight, norm).float().square().mean()
+        loss = forward(value, weight, norm).float().square().mean()
     loss.backward()
     torch.cuda.synchronize()
-    _require(torch.isfinite(loss).item(), "Compiled fused forward is not finite")
+    _require(torch.isfinite(loss).item(), "Fused forward is not finite")
     _require(all(x.grad is not None and torch.isfinite(x.grad).all().item() for x in (value, weight, norm)),
-             "Compiled fused backward or CPU checkpoint offload failed")
+             "Fused backward or CPU checkpoint offload failed")
 
 
 def environment_report():
@@ -113,7 +109,7 @@ def environment_report():
             result.update(gpu=torch.cuda.get_device_name(0), compute_capability=list(torch.cuda.get_device_capability(0)),
                           gpu_total_gib=round(torch.cuda.get_device_properties(0).total_memory / 2**30, 2))
             check("flash_and_packed_attention", _attention_check)
-            check("triton_compile_backward_cpu_offload", _compile_check)
+            check("fused_backward_cpu_offload", _fused_backward_check)
     except Exception as error:
         checks["cuda_runtime"] = {"ok": False, "error": str(error)}
     if shutil.which("nvidia-smi"):

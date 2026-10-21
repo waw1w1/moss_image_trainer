@@ -4,6 +4,7 @@ import dataclasses
 import gc
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -59,14 +60,30 @@ def model_fingerprint(model_path):
     return digest(files)
 
 
+def directory_repeats(directory: Path, root: Path) -> int:
+    """Use the nearest repeat prefix, including root but never its parents."""
+    relative = directory.relative_to(root)
+    for name in reversed((root.name, *relative.parts)):
+        match = re.match(r"^([+-]?[0-9]+)_", name)
+        if match:
+            repeats = int(match[1])
+            if repeats < 0:
+                raise ValueError(f"Directory repeat must be nonnegative: {directory}")
+            return repeats
+    return 1
+
+
 def scan_dataset(config: Config):
-    root = Path(config.dataset.image_dir)
+    root = Path(config.dataset.image_dir).absolute()
     if not root.is_dir():
         raise FileNotFoundError(f"Create the image/caption dataset directory first: {root}")
     buckets = BucketManager(config.dataset)
     records = []
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        repeats = directory_repeats(path.parent, root)
+        if repeats == 0:
             continue
         caption_path = path.with_suffix(config.dataset.caption_extension)
         if not caption_path.is_file():
@@ -82,6 +99,7 @@ def scan_dataset(config: Config):
             "resized_size": list(resized), "crop": list(crop),
         }
         record["key"] = digest(record)
+        record["repeats"] = repeats
         records.append(record)
     if not records:
         raise ValueError(f"No supported images found in {root}")
@@ -98,7 +116,7 @@ def cache_spec(config, records):
         "records": records,
     }
     # Runtime batching and file locations do not change feature values.
-    for key in ("batch_size", "num_repeats", "image_dir"):
+    for key in ("batch_size", "image_dir"):
         spec["dataset"].pop(key)
     spec["cache"].pop("directory")
     spec = json.loads(json.dumps(spec))

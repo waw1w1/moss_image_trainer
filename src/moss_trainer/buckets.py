@@ -74,11 +74,14 @@ class BucketManager:
 class BucketBatchSampler:
     """Shuffle within buckets and shuffle batches, preserving incomplete tail batches."""
 
-    def __init__(self, records, batch_size: int, repeats: int, seed: int):
-        if type(batch_size) is not int or batch_size < 1 or type(repeats) is not int or repeats < 1:
-            raise ValueError("batch_size and repeats must be positive integers")
+    def __init__(self, records, batch_size: int, seed: int):
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
         self.groups = defaultdict(list)
         for index, record in enumerate(records):
+            repeats = record["repeats"]
+            if type(repeats) is not int or repeats < 1:
+                raise ValueError("Record repeats must be a positive integer")
             self.groups[tuple(record["bucket"])].extend([index] * repeats)
         self.batch_size, self.seed, self.epoch = batch_size, seed, 0
         self.start_batch = 0

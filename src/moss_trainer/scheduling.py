@@ -47,9 +47,14 @@ def checkpoint_name(config, step, next_epoch, next_batch):
     return f"step-{step:08d}"
 
 
-def build_optimizer(parameters, training):
+def build_optimizer(parameters, training, *, named_parameters=None):
     """Use native PyTorch optimizers; keep AdamW's existing defaults."""
     import torch
+    if training.optimizer == "muon_adamw":
+        from .optimizers import HybridMuonAdamW
+        if named_parameters is None:
+            raise ValueError("Hybrid optimizer requires named adapter parameters")
+        return HybridMuonAdamW(named_parameters, training)
     classes = {"adamw": torch.optim.AdamW, "adam": torch.optim.Adam,
                "sgd": torch.optim.SGD, "rmsprop": torch.optim.RMSprop}
     options = {"lr": training.learning_rate, "weight_decay": training.weight_decay,
@@ -63,6 +68,7 @@ def build_scheduler(optimizer, training, plan):
     """Index is completed optimizer updates; warmup runs only once."""
     import torch
     warmup = plan.warmup_steps
+    minimum = training.min_learning_rate / training.learning_rate
 
     def multiplier(step):
         if step < warmup:
@@ -73,9 +79,9 @@ def build_scheduler(optimizer, training, plan):
         if training.scheduler == "linear":
             return 1.0 - progress
         if progress >= 1.0:
-            return 0.0
+            return minimum
         if training.scheduler == "cosine_with_restarts":
             progress = (progress * (training.cosine_restarts + 1)) % 1.0
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        return minimum + (1.0 - minimum) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
