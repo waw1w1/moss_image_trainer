@@ -101,6 +101,8 @@ LoKr 示例默认 `full_matrix=true`、`train_norm=true`、`factor=8`，训练�
 
 可选 `[optimization].checkpoint_offload_pool=true` 复用已释放检查点的连续输入 pinned CPU 缓冲，要求同时启用 `compile_blocks` 与 `checkpoint_offload`，默认关闭；非连续输入沿用原卸载路径。每个 block 最多保留一个空闲缓冲，只有形状、步幅和 dtype 相同才复用；图释放前不归还，复用前等待该缓冲的复制事件。它减少缓冲申请次数，不减少卸载字节或传输量，也不直接节省显存；PyTorch 本身已有 pinned allocator 缓存，新增事件也有开销，因此吞吐收益需要在目标 GPU 上对照验证。
 
+回归测试与四组 Linux/NVIDIA A/B（压力负载、真实 MOSS 训练及断点重放）见 [benchmarks/README.md](benchmarks/README.md)。
+
 这两个可选项参考 KohakuMossTrainer 报告中的优化方向，使用现有卸载路径和 PyTorch 公共 API 实现。先在新训练中单独比较，再组合启用。普通 AdamW 与 `adamw_fused`、不同 pool 设置不能互相切换后直接续训；`--new-stage` 也保留这些执行设置。未启用新选项时保留旧检查点签名。
 
 `compile_blocks=true` 要求：

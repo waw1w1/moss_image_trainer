@@ -207,18 +207,20 @@ def _training_only_compilation(forward, compiled, block, cache_state=None):
     return wrapped
 
 
-def _cache_checkpoint_input(cache, host, events):
+def _cache_checkpoint_input(cache, host, events, reusable):
     # One free buffer per block, rather than retaining every bucket's layout.
-    cache[:] = [(host, events)]
+    if reusable[0]:
+        cache[:] = [(host, events)]
 
 
 class _PooledCheckpointInput:
     def __init__(self, device, host, ready, cache):
         self.device, self.host, self.ready = device, host, ready
         self.events = [ready]
+        self.reusable = [True]
         # Unpack can run repeatedly (including retain_graph). Recycle only when
         # autograd releases the saved object, and never capture that object here.
-        weakref.finalize(self, _cache_checkpoint_input, cache, host, self.events)
+        weakref.finalize(self, _cache_checkpoint_input, cache, host, self.events, self.reusable)
 
 
 def _offload_checkpoint_input(forward, block, *, pool=False):
@@ -247,9 +249,14 @@ def _offload_checkpoint_input(forward, block, *, pool=False):
             stream = torch.cuda.current_stream(tensor.device)
             pooled = pool and tensor.is_contiguous()
             host = None
-            if pooled and cache:
-                candidate, events = cache.pop()
-                if (candidate.size() == tensor.size() and candidate.stride() == tensor.stride()
+            if pooled:
+                # Finalizers/other forwards can consume this slot on another
+                # Python thread. Do not split availability testing from pop.
+                try:
+                    candidate, events = cache.pop()
+                except IndexError:
+                    candidate = None
+                if (candidate is not None and candidate.size() == tensor.size() and candidate.stride() == tensor.stride()
                         and candidate.dtype == tensor.dtype):
                     for event in events:
                         stream.wait_event(event)
@@ -275,11 +282,19 @@ def _offload_checkpoint_input(forward, block, *, pool=False):
             stream = torch.cuda.current_stream(device)
             stream.wait_event(ready)
             restored = torch.empty_strided(host.size(), host.stride(), dtype=host.dtype, device=device)
-            restored.copy_(host, non_blocking=True)
-            if pooled:
-                # Include every H2D reader before a later D2H overwrites the host
-                # buffer, even when repeated unpack calls use different streams.
-                packed.events.append(stream.record_event())
+            try:
+                restored.copy_(host, non_blocking=True)
+                if pooled:
+                    # Include every H2D reader before a later D2H overwrites the host
+                    # buffer, even when repeated unpack calls use different streams.
+                    packed.events.append(stream.record_event())
+            except BaseException:
+                if pooled:
+                    # The copy may already be queued without a recorded reader.
+                    # Let PyTorch's pinned allocator retire this allocation; never
+                    # return it to our manual pool with incomplete dependencies.
+                    packed.reusable[0] = False
+                raise
             return restored
 
         with torch.autograd.graph.saved_tensors_hooks(pack, unpack):

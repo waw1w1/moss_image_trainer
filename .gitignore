@@ -8,6 +8,14 @@
 !/setup.sh
 !/configs/
 !/src/
+!/tests/
+!/benchmarks/
+/tests/*
+!/tests/*.py
+/benchmarks/*
+!/benchmarks/*.py
+!/benchmarks/*.md
+!/benchmarks/*.txt
 /configs/*
 !/configs/lora.toml
 !/configs/lokr.toml
